@@ -41,6 +41,7 @@
 #include "naga/cospan/metadata.hpp"
 #include "naga/cospan/runtime.hpp"
 #include "naga/cospan/shape_hook.hpp"
+#include "naga/cospan/solver.hpp"
 #include "naga/cospan/subsystem.hpp"
 #include "naga/cospan/variable.hpp"
 
@@ -94,6 +95,8 @@ struct Node {
 
     bool                        in_scope = true;
     std::shared_ptr<RunPolicy>  policy;
+    std::shared_ptr<Solver>     solver;      ///< a system node: solves the cycles it owns (solver.hpp)
+    std::optional<SolveResult>  last_solve;  ///< the last solve at this node
     std::vector<Operation>      before, after;
     std::optional<sycl::device> device_override;       ///< set_device, applied at finalize
     std::vector<std::weak_ptr<Instance>> holders;     ///< the instances this node owns (a system's aliases, a leaf's ports)

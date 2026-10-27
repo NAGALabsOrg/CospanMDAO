@@ -280,6 +280,14 @@ public:
         node_at(rel, "clear_run_policy").policy.reset();
     }
 
+    /// Attaches a solver to this System: it solves the cycles this System owns (docs/solvers.md). Legal inside this System's
+    /// setup() and at any time after the model's setup().
+    void set_solver(std::unique_ptr<Solver> s) {
+        detail::Node& n = self_node();
+        n.solver        = std::shared_ptr<Solver>(std::move(s));
+        n.last_solve.reset();
+    }
+
     // ---- optimization marks: the last of a kind on a variable wins ---------------
     /// A free input of fixed shape.
     void add_design_var(std::string_view path, Bounds b = {}, Scaling s = {}) {

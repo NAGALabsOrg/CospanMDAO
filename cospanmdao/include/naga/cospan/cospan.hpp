@@ -3,6 +3,7 @@
 // naga/cospan/cospan.hpp — umbrella
 
 #include "naga/cospan/derivative_error.hpp"
+#include "naga/cospan/solver.hpp"
 #include "naga/cospan/diagnostics.hpp"
 #include "naga/cospan/dtype.hpp"
 #include "naga/cospan/host_view.hpp"

@@ -85,9 +85,9 @@ namespace detail {
 
 /// The components of the model in run order: the same depth-first walk as Model::walk, over the nodes in scope. A run policy
 /// anywhere in scope throws (phase 1).
-inline std::vector<ComponentBase*> build_execution_list(ModelMeta& m) {
+inline std::vector<ComponentBase*> build_execution_list(Node& start) {
     std::vector<ComponentBase*> out;
-    std::vector<Node*>          stack{m.root};
+    std::vector<Node*>          stack{&start};
     while (!stack.empty()) {
         Node* n = stack.back();
         stack.pop_back();
@@ -104,6 +104,9 @@ inline std::vector<ComponentBase*> build_execution_list(ModelMeta& m) {
     }
     return out;
 }
+
+/// The whole model.
+inline std::vector<ComponentBase*> build_execution_list(ModelMeta& m) { return build_execution_list(*m.root); }
 
 /// The distinct variables a component reads (in) and writes (out), in port order.
 struct VarSets {
@@ -153,6 +156,31 @@ inline std::unordered_set<const VarMeta*> activity(const std::vector<ComponentBa
     return out;
 }
 
+/// The input port instances of the cycle variables Z that belong to a component at or before the variable's producer in
+/// `list`: they read the PREVIOUS value of the variable (the one the producer has not yet replaced).
+inline std::unordered_set<const Instance*> readers_before(const std::vector<ComponentBase*>&        list,
+                                                          const std::unordered_set<const VarMeta*>& Z) {
+    std::unordered_set<const Instance*> out;
+    for (const VarMeta* z : Z) {
+        std::size_t producer = list.size();
+        int         count    = 0;
+        for (std::size_t i = 0; i < list.size(); ++i) {
+            const VarSets v = vars_of(*list[i]);
+            if (std::find(v.out.begin(), v.out.end(), z) != v.out.end()) {
+                producer = i;
+                ++count;
+            }
+        }
+        if (count != 1)
+            throw DerivativeError("naga::cospan: cycle variable '" + z->display_path() + "' has " + std::to_string(count) +
+                                  " producers on the derivative path");
+        for (std::size_t i = 0; i <= producer; ++i)
+            for (const std::shared_ptr<Instance>& inst : ComponentAccess::ports(*list[i]))
+                if (inst->kind == IOKind::input && inst->meta.get() == z) out.insert(inst.get());
+    }
+    return out;
+}
+
 /// The one gating and capability check of a component that will launch.
 inline void check_launchable(const ComponentBase& c, bool forward) {
     if (!c.is_kernel_stage())
@@ -197,9 +225,16 @@ public:
     std::unordered_set<const VarMeta*>             active;
     DerivStats                                     stats;
 
+    // Cycles (docs/solvers.md): `cut` are the cycle variables of the coupled solve, `prev` their "previous value" buffers (what a
+    // reader placed before the producer sees), `reads_prev` those readers' input ports.
+    std::unordered_map<const VarMeta*, Buf>        prev;
+    std::unordered_set<const VarMeta*>             cut;
+    std::unordered_set<const Instance*>            reads_prev;
+
     /// The buffer a derivative kernel's wrapper for this port is pointed at.
     void* pointer(const Instance& inst, DerivRole role) const override {
         const VarMeta* m = inst.meta.get();
+        if (active.contains(m) && reads_prev.contains(&inst)) return const_cast<float*>(prev.at(m).v->data());
         if (active.contains(m)) return const_cast<float*>(bufs.at(m).v->data());
         const Scratch& s = scratch.at(inst.device);
         if (role == DerivRole::tangent_in || role == DerivRole::adjoint_in) return const_cast<float*>(s.zero->data());
@@ -213,17 +248,21 @@ public:
                 const VarMeta* m     = inst->meta.get();
                 const std::size_t numel = m->shape.elements();
                 const sycl::device& dev = inst->device;
-                if (active.contains(m)) {
-                    auto it = bufs.find(m);
-                    if (it != bufs.end() && !(it->second.dev == dev))
+                const auto ensure = [&](std::unordered_map<const VarMeta*, Buf>& map) {
+                    auto it = map.find(m);
+                    if (it != map.end() && !(it->second.dev == dev))
                         throw DerivativeError("naga::cospan: variable spans devices: '" + m->display_path() + "'");
-                    if (it == bufs.end() || it->second.n != numel) {
+                    if (it == map.end() || it->second.n != numel) {
                         Buf b;
                         b.dev = dev;
                         b.n   = numel;
                         b.v.emplace(numel, rt.allocator_for<float>(dev, sk::kind::device));
-                        bufs.insert_or_assign(m, std::move(b));
+                        map.insert_or_assign(m, std::move(b));
                     }
+                };
+                if (active.contains(m)) {
+                    ensure(bufs);
+                    if (cut.contains(m)) ensure(prev);
                 }
                 Scratch& sc = scratch[dev];
                 if (sc.n < numel || !sc.zero) {
@@ -241,7 +280,8 @@ public:
     /// One sweep: zero every active buffer that is not seeded, copy in the seeds, launch the components in the given order (each
     /// after all the earlier ones), wait on the last.
     void sweep(Runtime& rt, const std::vector<ComponentBase*>& launched, bool forward,
-               const std::unordered_map<const VarMeta*, std::vector<float>>& seeds) {
+               const std::unordered_map<const VarMeta*, std::vector<float>>& seeds,
+               const std::unordered_map<const VarMeta*, std::vector<float>>& prev_seeds = {}) {
         stats.launched.clear();
         stats.n_jvp = 0;
         stats.n_vjp = 0;
@@ -251,6 +291,16 @@ public:
             if (!active.contains(m)) continue;
             const auto sd = seeds.find(m);
             if (sd == seeds.end()) {
+                pre.push_back(b.v->fill(0.0f));
+            } else {
+                if (sd->second.size() != b.n) throw std::logic_error("naga::cospan: derivative seed has the wrong size for '" + m->display_path() + "'");
+                pre.push_back(b.v->from_host(std::span<const float>{sd->second}));
+            }
+        }
+        for (auto& [m, b] : prev) {
+            if (!active.contains(m) || !cut.contains(m)) continue;
+            const auto sd = prev_seeds.find(m);
+            if (sd == prev_seeds.end()) {
                 pre.push_back(b.v->fill(0.0f));
             } else {
                 if (sd->second.size() != b.n) throw std::logic_error("naga::cospan: derivative seed has the wrong size for '" + m->display_path() + "'");
@@ -268,6 +318,16 @@ public:
             else ++stats.n_vjp;
         }
         sycl::event::wait(evs);
+    }
+
+    /// The "previous value" buffer of an active cut variable on the host; zeros if there is none.
+    std::vector<float> read_prev(const VarMeta* v) {
+        const auto it = prev.find(v);
+        if (active.contains(v) && it != prev.end() && it->second.v) {
+            auto hv = it->second.v->host_view();
+            return std::vector<float>(hv.begin(), hv.end());
+        }
+        return std::vector<float>(v->shape.elements(), 0.0f);
     }
 
     /// The buffer of an active variable on the host; zeros for an inactive one.

@@ -332,6 +332,16 @@ public:
         sys(*m, "clear_run_policy").clear_run_policy(rel);
     }
 
+    /// Attaches a solver to this subsystem (a System; a leaf throws std::invalid_argument). See System::set_solver.
+    void set_solver(std::unique_ptr<Solver> s) const {
+        const auto    m = detail::lock_meta(meta_, "set_solver");
+        detail::Node& n = node(*m);
+        if (n.kind == detail::NodeKind::leaf)
+            throw std::invalid_argument("naga::cospan: set_solver: '" + path_ + "' is a leaf; a solver belongs to a System");
+        n.solver = std::shared_ptr<Solver>(std::move(s));
+        n.last_solve.reset();
+    }
+
 private:
     friend class Model;
     SubsystemHandle(std::weak_ptr<detail::ModelMeta> meta, detail::Runtime* rt, std::string path)
@@ -480,7 +490,7 @@ public:
         if (s.meta->state != detail::Lifecycle::finalized) finalize_impl(s);
         ++s.rt.forward;
         detail::materialize_pending(*s.meta, s.rt);
-        walk(*s.meta, s.rt);
+        walk_nodes(s, {s.meta->root});
     }
 
     /// queue.wait_and_throw() on both queues. OPTIONAL: for "everything I submitted is done" and to surface
@@ -543,6 +553,21 @@ public:
         root_handle("set_run_policy").set_run_policy(path, policy);
     }
     void clear_run_policy(std::string_view path) { root_handle("clear_run_policy").clear_run_policy(path); }
+
+    // ---- solvers (docs/solvers.md) ---------------------------------------------------------
+    /// Attaches a solver to the System at `path` ("" is the root): it solves the cycles that System owns at every run.
+    void set_solver(std::string_view path, std::unique_ptr<Solver> s) { get_subsystem(path).set_solver(std::move(s)); }
+    void set_solver(std::unique_ptr<Solver> s) { set_solver("", std::move(s)); }
+    /// The last solve at the System `path`. std::invalid_argument for an unknown node; std::logic_error if none was recorded.
+    const SolveResult& solve_result(std::string_view path) const {
+        Impl&         s = ready("solve_result");
+        detail::Node* n = s.meta->find_node(path);
+        if (n == nullptr) throw std::invalid_argument("naga::cospan: solve_result: no subsystem '" + std::string{path} + "'");
+        if (!n->last_solve) throw std::logic_error("naga::cospan: no solve recorded for '" + std::string{path} + "'");
+        return *n->last_solve;
+    }
+    /// The GMRES options of the coupled linear solves in compute_totals through cycles.
+    void set_linear_options(GmresOptions o) { impl("set_linear_options").lin_opts = o; }
 
     /// Puts the subsystem at `path` (and everything under it) back in scope, counters reset, between runs: for every leaf in
     /// its range the leaf is rearmed and its policy's rearm called. On a subsystem already in scope it resets the counters.
@@ -623,10 +648,6 @@ public:
         for (const Ref& r : wrts) seeds.insert(r.meta);
         for (const Ref& r : ofs) responses.insert(r.meta);
         const std::unordered_set<const detail::VarMeta*> active = detail::activity(list, seeds, responses);
-        for (const detail::VarMeta* v : active)
-            if (v->cycle)
-                throw DerivativeError("naga::cospan: cycle on the derivative path: '" + v->display_path() + "'; a solver is required");
-
         std::size_t n_of = 0, n_wrt = 0;
         for (const Ref& r : ofs) n_of += r.n;
         for (const Ref& r : wrts) n_wrt += r.n;
@@ -638,8 +659,102 @@ public:
         d.stats                 = DerivStats{};
         for (const detail::VarMeta* v : active) d.stats.active_vars.push_back(v->display_path());
         std::sort(d.stats.active_vars.begin(), d.stats.active_vars.end());
+        // Cycles: Z are the active cycle variables, in the order their producers appear in the run order. At a converged state
+        // z = G(x, z): forward mode solves (I - G_z) dz = G_x dx; reverse mode solves (I - G_z^T) delta = p1 (p1 is what the first
+        // reverse sweep leaves on the readers placed before the producer) and seeds the producer side with s0 + delta, so the
+        // producer sees lambda = m1 + delta. Totals through a cycle assume the cycle is converged (docs/solvers.md).
+        using SeedMap = std::unordered_map<const detail::VarMeta*, std::vector<float>>;
+        std::vector<const detail::VarMeta*> Zv;
+        for (ComponentBase* c : list)
+            for (const detail::VarMeta* v : detail::vars_of(*c).out)
+                if (active.contains(v) && v->cycle && std::find(Zv.begin(), Zv.end(), v) == Zv.end()) Zv.push_back(v);
+        const bool                                coupled = !Zv.empty();
+        const std::unordered_set<const detail::VarMeta*> Zset(Zv.begin(), Zv.end());
+        std::vector<ComponentBase*>               sel_op;
+        std::size_t                               nz = 0;
+        for (const detail::VarMeta* z : Zv) nz += z->shape.elements();
+        if (coupled) {
+            d.cut        = Zset;
+            d.reads_prev = detail::readers_before(list, Zset);
+            sel_op       = detail::select(list, detail::activity(list, Zset, Zset), fwd);
+        } else {
+            d.cut.clear();
+            d.reads_prev.clear();
+        }
         const std::vector<ComponentBase*> launched = detail::select(list, active, fwd);
         d.prepare(s.rt, launched);
+        if (coupled) d.prepare(s.rt, sel_op);
+
+        // A vector over Z split into one float slice per cycle variable; and the cycle variables' buffers read back, in double.
+        const auto split = [&](std::span<const double> v) {
+            SeedMap     out;
+            std::size_t off = 0;
+            for (const detail::VarMeta* z : Zv) {
+                const std::size_t n = z->shape.elements();
+                std::vector<float> sl(n);
+                for (std::size_t i = 0; i < n; ++i) sl[i] = static_cast<float>(v[off + i]);
+                out[z] = std::move(sl);
+                off += n;
+            }
+            return out;
+        };
+        const auto gather = [&](bool previous) {
+            std::vector<double> out;
+            out.reserve(nz);
+            for (const detail::VarMeta* z : Zv) {
+                const std::vector<float> vals = previous ? d.read_prev(z) : d.read(z);
+                out.insert(out.end(), vals.begin(), vals.end());
+            }
+            return out;
+        };
+        // x = A^{-1} b (or A^{-T} b) for A = I - G_z, by GMRES with s.lin_opts.
+        const auto solve_lin = [&](const std::vector<double>& b, bool transpose) {
+            std::vector<double> x(nz, 0.0);
+            const GmresResult   g = gmres(
+                nz,
+                [&](std::span<const double> v, std::span<double> out) {
+                    if (!transpose) {
+                        d.sweep(s.rt, sel_op, true, SeedMap{}, split(v));
+                        const std::vector<double> gz = gather(false);
+                        for (std::size_t i = 0; i < nz; ++i) out[i] = v[i] - gz[i];
+                    } else {
+                        d.sweep(s.rt, sel_op, false, split(v), SeedMap{});
+                        const std::vector<double> gz = gather(true);
+                        for (std::size_t i = 0; i < nz; ++i) out[i] = v[i] - gz[i];
+                    }
+                },
+                b, x, s.lin_opts);
+            if (!g.converged)
+                throw DerivativeError("naga::cospan: compute_totals: the coupled linear solve did not converge (residual " +
+                                      std::to_string(g.residual_norm) + ")");
+            return x;
+        };
+        // One forward / reverse derivative sweep with the seed `e` on `m`; through a cycle: the coupled solve and a final sweep.
+        const auto fwd_sweep = [&](const detail::VarMeta* m, const std::vector<float>& e) {
+            if (!coupled) {
+                d.sweep(s.rt, launched, true, SeedMap{{m, e}});
+                return;
+            }
+            d.sweep(s.rt, launched, true, SeedMap{{m, e}}, SeedMap{});
+            const std::vector<double> dz = solve_lin(gather(false), false);
+            d.sweep(s.rt, launched, true, SeedMap{{m, e}}, split(dz));
+        };
+        const auto rev_sweep = [&](const detail::VarMeta* m, const std::vector<float>& e) {
+            if (!coupled) {
+                d.sweep(s.rt, launched, false, SeedMap{{m, e}});
+                return;
+            }
+            d.sweep(s.rt, launched, false, SeedMap{{m, e}}, SeedMap{});
+            const std::vector<double> delta = solve_lin(gather(true), true);
+            SeedMap                   seeds = split(delta);
+            auto                      it    = seeds.find(m);
+            if (it == seeds.end()) {
+                seeds[m] = e;
+            } else {
+                for (std::size_t i = 0; i < e.size(); ++i) it->second[i] += e[i];
+            }
+            d.sweep(s.rt, launched, false, seeds, SeedMap{});
+        };
 
         Jacobian jac;
         for (const Ref& o : ofs)
@@ -650,7 +765,7 @@ public:
                 for (std::size_t j = 0; j < w.n; ++j) {
                     std::vector<float> e(w.n, 0.0f);
                     e[j] = 1.0f;
-                    d.sweep(s.rt, launched, true, {{w.meta, std::move(e)}});
+                    fwd_sweep(w.meta, e);
                     for (const Ref& o : ofs) {
                         const std::vector<float> col = d.read(o.meta);
                         JacBlock&                blk = jac.blocks[{o.path, w.path}];
@@ -663,7 +778,7 @@ public:
                 for (std::size_t i = 0; i < o.n; ++i) {
                     std::vector<float> e(o.n, 0.0f);
                     e[i] = 1.0f;
-                    d.sweep(s.rt, launched, false, {{o.meta, std::move(e)}});
+                    rev_sweep(o.meta, e);
                     for (const Ref& w : wrts) {
                         const std::vector<float> row = d.read(w.meta);
                         JacBlock&                blk = jac.blocks[{o.path, w.path}];
@@ -769,6 +884,8 @@ public:
         if (!s.deriv) s.deriv = std::make_unique<detail::DerivSession>();
         detail::DerivSession& d = *s.deriv;
         d.active.clear();
+        d.cut.clear();         // check_partials is about one component: no cycle handling
+        d.reads_prev.clear();
         for (const detail::VarMeta* v : vs.in) d.active.insert(v);
         for (const detail::VarMeta* v : vs.out) d.active.insert(v);
         const std::vector<ComponentBase*> launched{c};
@@ -946,6 +1063,7 @@ private:
         RootFactory         make_root;
         std::vector<std::function<void(System&)>> adds;  ///< model.add_subsystem calls, in order, for a reset
         bool                setup_done = false;
+        GmresOptions        lin_opts;  ///< compute_totals through cycles
         std::unique_ptr<detail::DerivSession> deriv;  ///< the derivative buffers; destroyed right after meta, before rt
         std::shared_ptr<detail::ModelMeta> meta;  ///< LAST: destroyed first
     };
@@ -1173,7 +1291,9 @@ private:
     /// The iterative tree walk (explicit stack). Per node: its before-operations, its policy's before; then a leaf in scope
     /// runs forward(rt) and a system in scope is descended into (an out-of-scope system's subtree is skipped); then its
     /// after-operations and its policy's after.
-    static void walk(detail::ModelMeta& m, detail::Runtime& rt) {
+    void walk_nodes(Impl& s, const std::vector<detail::Node*>& roots) {
+        detail::ModelMeta& m  = *s.meta;
+        detail::Runtime&   rt = s.rt;
         struct Frame {
             detail::Node* n;
             std::size_t   next;
@@ -1188,6 +1308,10 @@ private:
                 if (n->in_scope) n->sub->forward(rt);
                 return false;
             }
+            if (n->in_scope && n->solver) {  // a solved System: its children run inside the solve (docs/solvers.md)
+                solve_node(s, *n);
+                return false;
+            }
             return n->in_scope && !n->children.empty();
         };
         const auto leave = [&](detail::Node* n) {
@@ -1198,19 +1322,224 @@ private:
             if (enter(n)) stack.push_back(Frame{n, 0});
             else leave(n);
         };
-        visit(m.root);
-        while (!stack.empty()) {
-            Frame& f = stack.back();
-            if (f.next < f.n->children.size()) {
-                detail::Node* c = f.n->children[f.next++];
-                visit(c);  // may push: f is not used again
-            } else {
-                detail::Node* n = f.n;
-                stack.pop_back();
-                leave(n);
+        for (detail::Node* root : roots) {
+            visit(root);
+            while (!stack.empty()) {
+                Frame& f = stack.back();
+                if (f.next < f.n->children.size()) {
+                    detail::Node* c = f.n->children[f.next++];
+                    visit(c);  // may push: f is not used again
+                } else {
+                    detail::Node* n = f.n;
+                    stack.pop_back();
+                    leave(n);
+                }
             }
         }
     }
+
+    // ---- solvers ---------------------------------------------------------------------------
+    /// A cycle variable a solved System owns: its single producer and size.
+    struct Owned {
+        const detail::VarMeta*            meta;
+        std::shared_ptr<detail::Instance> producer;
+        std::size_t                       numel;
+    };
+
+    /// The cycle variables `n` owns. The OWNER of a cycle variable is the deepest solved System above its producer (in scope)
+    /// whose leaf range contains the variable's earliest reader.
+    static std::vector<Owned> owned_cycles(Impl& s, detail::Node& n) {
+        std::vector<Owned>                         out;
+        std::unordered_set<const detail::VarMeta*> seen;
+        for (detail::Node* leaf : leaves_under(n)) {
+            for (const std::weak_ptr<detail::Instance>& w : leaf->holders) {
+                const std::shared_ptr<detail::Instance> held = w.lock();
+                if (!held) continue;
+                detail::VarMeta* v = held->meta.get();
+                if (!v->cycle || !seen.insert(v).second) continue;
+                std::shared_ptr<detail::Instance> producer;
+                int                               count = 0;
+                std::size_t                       reader = static_cast<std::size_t>(-1);
+                for (const std::shared_ptr<detail::Instance>& i : v->live_instances()) {
+                    if (i->kind == IOKind::output && i->role == detail::Role::port) {
+                        producer = i;
+                        ++count;
+                    } else if (i->kind == IOKind::input && i->role == detail::Role::port) {
+                        const detail::Node* rn = s.meta->node_of(*i);
+                        if (rn != nullptr) reader = std::min(reader, rn->ordinal);
+                    }
+                }
+                if (count != 1)
+                    throw SolverError("naga::cospan: cycle variable '" + v->display_path() + "' has " + std::to_string(count) +
+                                      " producers; a solved cycle needs exactly one");
+                const detail::Node* P     = s.meta->node_of(*producer);
+                const detail::Node* owner = nullptr;
+                for (const detail::Node* a = P == nullptr ? nullptr : P->parent; a != nullptr; a = a->parent)
+                    if (a->kind == detail::NodeKind::system && a->solver != nullptr && a->in_scope && a->ordinal <= reader &&
+                        reader <= a->last_ordinal) {
+                        owner = a;
+                        break;
+                    }
+                if (owner != &n) continue;
+                if (v->dtype != DType::f32 || v->is_ragged() || !v->shape.known)
+                    throw SolverError("naga::cospan: cycle variable '" + v->display_path() + "' must be dense f32 of known shape");
+                out.push_back(Owned{v, producer, v->shape.elements()});
+            }
+        }
+        return out;
+    }
+
+    class SystemProblem;
+
+    /// Runs the solved System `n`: the initial pass over its children, then its solver on the cycles it owns.
+    void solve_node(Impl& s, detail::Node& n) {
+        {
+            std::vector<detail::Node*> st(n.children.begin(), n.children.end());
+            while (!st.empty()) {
+                detail::Node* x = st.back();
+                st.pop_back();
+                if (x->policy)
+                    throw SolverError("naga::cospan: a run policy inside the solved system '" + n.name + "' is not supported ('" + x->name + "')");
+                for (detail::Node* c : x->children) st.push_back(c);
+            }
+        }
+        std::vector<Owned> owned = owned_cycles(s, n);
+        walk_nodes(s, n.children);  // the INITIAL PASS: every time
+        wait();
+        if (owned.empty()) {
+            n.last_solve = SolveResult{true, 0, 0, 0, 0, 0, {}, "no cycle variables"};
+            return;
+        }
+        SystemProblem prob{*this, s, n, std::move(owned)};
+        const SolveResult r = n.solver->solve(prob);
+        n.last_solve        = r;
+        if (!r.converged && n.solver->raise_on_failure)
+            throw SolverError("naga::cospan: " + n.solver->name() + " on '" + n.name + "' did not converge: " + r.message);
+    }
+
+    /// The cycles of a solved System as the nonlinear problem r(z) = z - G(z) = 0 over the owned cycle variables (concatenated, in
+    /// double). evaluate(z) writes z into each variable's producer data, runs the System's children once, and reads G(z) back from
+    /// the producers. jvp / vjp apply (I - G_z) and its transpose by one derivative sweep over the System's components.
+    ///
+    /// LIMITATION: while iterating, a cycle variable's buffer holds G(z), so the derivative kernels of the readers placed BEFORE
+    /// the producer see G(z) as their primal input instead of z. The difference is the residual, so the Jacobian is exact at
+    /// convergence.
+    class SystemProblem final : public NonlinearProblem {
+    public:
+        SystemProblem(Model& model, Impl& impl, detail::Node& n, std::vector<Owned> owned)
+            : model_{model}, impl_{impl}, n_{n}, owned_{std::move(owned)} {
+            for (const Owned& o : owned_) nz_ += o.numel;
+        }
+
+        std::size_t size() const override { return nz_; }
+
+        void get_state(std::span<double> z) override {
+            model_.wait();
+            const std::vector<double> g = read_all();
+            std::copy(g.begin(), g.end(), z.begin());
+        }
+
+        void evaluate(std::span<const double> z, std::span<double> r) override {
+            std::vector<float> zf(nz_);
+            for (std::size_t i = 0; i < nz_; ++i) zf[i] = static_cast<float>(z[i]);
+            std::size_t off = 0;
+            for (const Owned& o : owned_) {
+                auto& d = dynamic_cast<detail::DeviceData<float>&>(*o.producer->data);
+                std::vector<sycl::event> deps = d.read_deps();
+                {
+                    const std::vector<sycl::event> w = d.write_deps();
+                    deps.insert(deps.end(), w.begin(), w.end());
+                }
+                sycl::event e = d.v().from_host(std::span<const float>{zf.data() + off, o.numel}, std::span<const sycl::event>{deps});
+                d.register_write(e);
+                d.register_read(e);
+                (void)o.producer->meta->push_from(o.producer->data, /*register_reads=*/true);
+                off += o.numel;
+            }
+            model_.walk_nodes(impl_, n_.children);
+            model_.wait();
+            const std::vector<double> g = read_all();
+            for (std::size_t i = 0; i < nz_; ++i) r[i] = static_cast<double>(zf[i]) - g[i];
+        }
+
+        void jvp(std::span<const double> v, std::span<double> out) override {
+            detail::DerivSession& d = session(sel_f_);
+            d.sweep(impl_.rt, sel_f_, true, SeedMap{}, slices(v));
+            const std::vector<double> g = gather(d, false);
+            for (std::size_t i = 0; i < nz_; ++i) out[i] = v[i] - g[i];
+        }
+
+        void vjp(std::span<const double> v, std::span<double> out) override {
+            detail::DerivSession& d = session(sel_r_);
+            d.sweep(impl_.rt, sel_r_, false, slices(v), SeedMap{});
+            const std::vector<double> g = gather(d, true);
+            for (std::size_t i = 0; i < nz_; ++i) out[i] = v[i] - g[i];
+        }
+
+    private:
+        using SeedMap = std::unordered_map<const detail::VarMeta*, std::vector<float>>;
+
+        std::vector<double> read_all() const {
+            std::vector<double> g;
+            g.reserve(nz_);
+            for (const Owned& o : owned_) {
+                const std::vector<float> v = detail::read_host(*o.producer);
+                g.insert(g.end(), v.begin(), v.end());
+            }
+            return g;
+        }
+        SeedMap slices(std::span<const double> v) const {
+            SeedMap     out;
+            std::size_t off = 0;
+            for (const Owned& o : owned_) {
+                std::vector<float> sl(o.numel);
+                for (std::size_t i = 0; i < o.numel; ++i) sl[i] = static_cast<float>(v[off + i]);
+                out[o.meta] = std::move(sl);
+                off += o.numel;
+            }
+            return out;
+        }
+        std::vector<double> gather(detail::DerivSession& d, bool previous) const {
+            std::vector<double> g;
+            g.reserve(nz_);
+            for (const Owned& o : owned_) {
+                const std::vector<float> v = previous ? d.read_prev(o.meta) : d.read(o.meta);
+                g.insert(g.end(), v.begin(), v.end());
+            }
+            return g;
+        }
+        /// The operator data (built on the first jvp / vjp), and the derivative session set up for it.
+        detail::DerivSession& session(const std::vector<ComponentBase*>& sel) {
+            if (!built_) {
+                const std::vector<ComponentBase*> list = detail::build_execution_list(n_);
+                for (const Owned& o : owned_) Z_.insert(o.meta);
+                active_op_  = detail::activity(list, Z_, Z_);
+                reads_prev_ = detail::readers_before(list, Z_);
+                sel_f_      = detail::select(list, active_op_, true);
+                sel_r_      = detail::select(list, active_op_, false);
+                built_      = true;
+            }
+            model_.wait();
+            if (!impl_.deriv) impl_.deriv = std::make_unique<detail::DerivSession>();
+            detail::DerivSession& d = *impl_.deriv;
+            d.active                = active_op_;
+            d.cut                   = Z_;
+            d.reads_prev            = reads_prev_;
+            d.prepare(impl_.rt, sel);
+            return d;
+        }
+
+        Model&              model_;
+        Impl&               impl_;
+        detail::Node&       n_;
+        std::vector<Owned>  owned_;
+        std::size_t         nz_ = 0;
+
+        bool                                built_ = false;
+        std::unordered_set<const detail::VarMeta*>  Z_, active_op_;
+        std::unordered_set<const detail::Instance*> reads_prev_;
+        std::vector<ComponentBase*>         sel_f_, sel_r_;
+    };
 
     std::unique_ptr<Impl> s_;
 };
