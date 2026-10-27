@@ -30,8 +30,10 @@
 // LAYERING. ~Model does not wait; call wait() when "everything I submitted is done" matters.
 
 #include <algorithm>
+#include <cmath>
 #include <concepts>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <initializer_list>
 #include <iostream>
@@ -44,11 +46,13 @@
 #include <tuple>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include <sycl/sycl.hpp>
 
+#include "naga/cospan/derivative.hpp"
 #include "naga/cospan/diagnostics.hpp"
 #include "naga/cospan/host_view.hpp"
 #include "naga/cospan/instance.hpp"
@@ -581,6 +585,267 @@ public:
     std::span<const Mark> constraints() const { return ready("constraints").meta->constraints; }
     std::span<const Mark> objectives() const { return ready("objectives").meta->objectives; }
 
+    // ---- derivatives (phase 1; see derivative.hpp and docs/derivatives.md) ---------------------------------
+    /// The total derivatives d(of)/d(wrt) by forward-mode or reverse-mode sweeps of the components' compute_jvp / compute_vjp.
+    /// Paths are root-relative, as System::add_design_var resolves them: `wrt` must be free inputs, `of` outputs, all dense f32.
+    /// Needs a prior run(); waits for the model first. `automatic` is reverse iff the number of output elements is smaller than
+    /// the number of input elements. Throws DerivativeError for a cycle on the path, a missing derivative kernel, a ragged or non-f32
+    /// variable, a run policy, or a custom-op or host component in the way.
+    Jacobian compute_totals(std::span<const std::string> of, std::span<const std::string> wrt, DerivMode mode = DerivMode::automatic) {
+        Impl& s = ready("compute_totals");
+        require_ran(s, "compute_totals");
+        wait();
+
+        struct Ref {
+            std::string           path;
+            const detail::VarMeta* meta;
+            std::size_t           n;
+        };
+        const auto resolve = [&](const std::string& p, bool want_input) -> Ref {
+            const std::shared_ptr<detail::Instance> inst = s.meta->find_holder(detail::ModelMeta::child_name("", p));
+            if (!inst) throw std::invalid_argument("naga::cospan: compute_totals: no input, output or alias '" + p + "'");
+            if (want_input) {
+                if (!(inst->kind == IOKind::input && !inst->meta->has_producer()))
+                    throw std::invalid_argument("naga::cospan: compute_totals: '" + p + "' is not a free input");
+            } else if (inst->kind != IOKind::output) {
+                throw std::invalid_argument("naga::cospan: compute_totals: '" + p + "' is not an output");
+            }
+            if (inst->meta->dtype != DType::f32 || inst->meta->is_ragged())
+                throw DerivativeError("naga::cospan: compute_totals: '" + p + "' is not a dense f32 variable");
+            return Ref{p, inst->meta.get(), inst->meta->shape.elements()};
+        };
+        std::vector<Ref> ofs, wrts;
+        for (const std::string& p : of) ofs.push_back(resolve(p, false));
+        for (const std::string& p : wrt) wrts.push_back(resolve(p, true));
+
+        const std::vector<ComponentBase*> list = detail::build_execution_list(*s.meta);
+        std::unordered_set<const detail::VarMeta*> seeds, responses;
+        for (const Ref& r : wrts) seeds.insert(r.meta);
+        for (const Ref& r : ofs) responses.insert(r.meta);
+        const std::unordered_set<const detail::VarMeta*> active = detail::activity(list, seeds, responses);
+        for (const detail::VarMeta* v : active)
+            if (v->cycle)
+                throw DerivativeError("naga::cospan: cycle on the derivative path: '" + v->display_path() + "'; a solver is required");
+
+        std::size_t n_of = 0, n_wrt = 0;
+        for (const Ref& r : ofs) n_of += r.n;
+        for (const Ref& r : wrts) n_wrt += r.n;
+        const bool fwd = mode == DerivMode::forward || (mode == DerivMode::automatic && !(n_of < n_wrt));
+
+        if (!s.deriv) s.deriv = std::make_unique<detail::DerivSession>();
+        detail::DerivSession& d = *s.deriv;
+        d.active                = active;
+        d.stats                 = DerivStats{};
+        for (const detail::VarMeta* v : active) d.stats.active_vars.push_back(v->display_path());
+        std::sort(d.stats.active_vars.begin(), d.stats.active_vars.end());
+        const std::vector<ComponentBase*> launched = detail::select(list, active, fwd);
+        d.prepare(s.rt, launched);
+
+        Jacobian jac;
+        for (const Ref& o : ofs)
+            for (const Ref& w : wrts) jac.blocks[{o.path, w.path}] = JacBlock{o.n, w.n, std::vector<double>(o.n * w.n, 0.0)};
+
+        if (fwd) {
+            for (const Ref& w : wrts) {
+                for (std::size_t j = 0; j < w.n; ++j) {
+                    std::vector<float> e(w.n, 0.0f);
+                    e[j] = 1.0f;
+                    d.sweep(s.rt, launched, true, {{w.meta, std::move(e)}});
+                    for (const Ref& o : ofs) {
+                        const std::vector<float> col = d.read(o.meta);
+                        JacBlock&                blk = jac.blocks[{o.path, w.path}];
+                        for (std::size_t i = 0; i < o.n; ++i) blk.data[i * blk.cols + j] = static_cast<double>(col[i]);
+                    }
+                }
+            }
+        } else {
+            for (const Ref& o : ofs) {
+                for (std::size_t i = 0; i < o.n; ++i) {
+                    std::vector<float> e(o.n, 0.0f);
+                    e[i] = 1.0f;
+                    d.sweep(s.rt, launched, false, {{o.meta, std::move(e)}});
+                    for (const Ref& w : wrts) {
+                        const std::vector<float> row = d.read(w.meta);
+                        JacBlock&                blk = jac.blocks[{o.path, w.path}];
+                        for (std::size_t c = 0; c < w.n; ++c) blk.data[i * blk.cols + c] = static_cast<double>(row[c]);
+                    }
+                }
+            }
+        }
+        return jac;
+    }
+
+    /// The Jacobian of the declared objectives and constraints (of) with respect to the design variables (wrt).
+    Jacobian compute_totals(DerivMode mode = DerivMode::automatic) {
+        std::vector<std::string> of, wrt;
+        for (const Mark& m : objectives()) of.push_back(m.path);
+        for (const Mark& m : constraints()) of.push_back(m.path);
+        for (const Mark& m : design_vars()) wrt.push_back(m.path);
+        return compute_totals(std::span<const std::string>{of}, std::span<const std::string>{wrt}, mode);
+    }
+
+    /// What the last sweep launched, and the active variables. Throws std::logic_error before the first compute_totals.
+    const DerivStats& last_deriv_stats() const {
+        Impl& s = ready("last_deriv_stats");
+        if (!s.deriv) throw std::logic_error("naga::cospan: last_deriv_stats: no derivative session yet (call compute_totals first)");
+        return s.deriv->stats;
+    }
+
+    /// Checks the derivative kernels of ONE component against central finite differences of its forward (every input must be
+    /// free) and, if it has compute_vjp, against its compute_jvp by the dot-product test. The model is run (by this call) with
+    /// perturbed inputs and left with the original values.
+    PartialsReport check_partials(std::string_view component_path, CheckOptions o = {}) {
+        Impl& s = ready("check_partials");
+        require_ran(s, "check_partials");
+        const auto found = s.meta->components.find(std::string{component_path});
+        if (found == s.meta->components.end())
+            throw std::invalid_argument("naga::cospan: check_partials: no component '" + std::string{component_path} + "'");
+        ComponentBase* c = found->second;
+        wait();
+        if (!c->has_jvp()) throw DerivativeError("naga::cospan: '" + c->path() + "' needs compute_jvp");
+        detail::check_launchable(*c, true);
+
+        const detail::VarSets vs = detail::vars_of(*c);
+        const auto            rep_of = [&](const detail::VarMeta* v) -> std::shared_ptr<detail::Instance> {
+            for (const std::shared_ptr<detail::Instance>& inst : detail::ComponentAccess::ports(*c))
+                if (inst->meta.get() == v) return inst;
+            throw std::logic_error("naga::cospan: check_partials: a variable without a port");
+        };
+        std::vector<std::shared_ptr<detail::Instance>> in_rep, out_rep;
+        for (const detail::VarMeta* v : vs.in) {
+            in_rep.push_back(rep_of(v));
+            if (v->has_producer())
+                throw std::invalid_argument("naga::cospan: check_partials: '" + in_rep.back()->full_path() + "' is connected; every input must be free");
+        }
+        for (const detail::VarMeta* v : vs.out) out_rep.push_back(rep_of(v));
+        for (const auto* reps : {&in_rep, &out_rep})
+            for (const auto& r : *reps)
+                if (r->meta->dtype != DType::f32 || r->meta->is_ragged())
+                    throw DerivativeError("naga::cospan: check_partials: '" + r->full_path() + "' is not a dense f32 variable");
+
+        using Vec = std::vector<std::vector<float>>;  // one vector per variable
+        const auto read_all = [&](const std::vector<std::shared_ptr<detail::Instance>>& reps) {
+            Vec out;
+            for (const auto& r : reps) out.push_back(detail::read_host(*r));
+            return out;
+        };
+        const auto set_inputs = [&](const Vec& vals) {
+            for (std::size_t k = 0; k < in_rep.size(); ++k) {
+                const detail::VarMeta&   meta = *in_rep[k]->meta;
+                std::vector<std::size_t> ext(meta.shape.extents.begin(), meta.shape.extents.begin() + meta.rank);
+                update_input(in_rep[k]->full_path(), init::from_host(vals[k], init::Shape{ext}));
+            }
+            run();
+            wait();
+        };
+        const Vec x0 = read_all(in_rep);
+
+        // xorshift64*; a uniform draw in [-1, 1).
+        std::uint64_t st   = o.seed ? o.seed : 0x9E3779B97F4A7C15ull;
+        const auto    next = [&]() {
+            st ^= st >> 12;
+            st ^= st << 25;
+            st ^= st >> 27;
+            return st * 0x2545F4914F6CDD1Dull;
+        };
+        const auto uniform = [&]() { return static_cast<double>(next() >> 11) * 0x1.0p-53 * 2.0 - 1.0; };
+        const auto draw    = [&](const Vec& like) {
+            Vec v;
+            for (const auto& a : like) {
+                std::vector<float> x(a.size());
+                for (float& e : x) e = static_cast<float>(uniform());
+                v.push_back(std::move(x));
+            }
+            return v;
+        };
+        std::vector<Vec> dirs;
+        for (int k = 0; k < o.directions; ++k) dirs.push_back(draw(x0));
+        const Vec vd = draw(x0);
+        Vec       y_shape;
+        for (const auto& r : out_rep) y_shape.emplace_back(r->meta->shape.elements(), 0.0f);
+        const Vec wd = draw(y_shape);
+
+        // The session, over exactly this component.
+        if (!s.deriv) s.deriv = std::make_unique<detail::DerivSession>();
+        detail::DerivSession& d = *s.deriv;
+        d.active.clear();
+        for (const detail::VarMeta* v : vs.in) d.active.insert(v);
+        for (const detail::VarMeta* v : vs.out) d.active.insert(v);
+        const std::vector<ComponentBase*> launched{c};
+        d.prepare(s.rt, launched);
+        const auto jvp = [&](const Vec& v) {
+            std::unordered_map<const detail::VarMeta*, std::vector<float>> seeds;
+            for (std::size_t k = 0; k < vs.in.size(); ++k) seeds[vs.in[k]] = v[k];
+            d.sweep(s.rt, launched, true, seeds);
+            Vec out;
+            for (const detail::VarMeta* m : vs.out) out.push_back(d.read(m));
+            return out;
+        };
+
+        PartialsReport rep;
+        rep.has_jvp = true;
+        rep.has_vjp = c->has_vjp();
+
+        // Central differences.
+        double xmax = 1.0;
+        for (const auto& a : x0)
+            for (float e : a) xmax = std::max(xmax, std::fabs(static_cast<double>(e)));
+        const double h = o.h_rel * xmax;
+        bool         fd_ok = true;
+        for (const Vec& v : dirs) {
+            Vec xp = x0, xm = x0;
+            for (std::size_t k = 0; k < x0.size(); ++k)
+                for (std::size_t e = 0; e < x0[k].size(); ++e) {
+                    xp[k][e] = static_cast<float>(static_cast<double>(x0[k][e]) + h * static_cast<double>(v[k][e]));
+                    xm[k][e] = static_cast<float>(static_cast<double>(x0[k][e]) - h * static_cast<double>(v[k][e]));
+                }
+            set_inputs(xp);
+            const Vec yp = read_all(out_rep);
+            set_inputs(xm);
+            const Vec ym = read_all(out_rep);
+            set_inputs(x0);
+            const Vec   j = jvp(v);
+            double      err2 = 0, fd2 = 0, jv2 = 0;
+            for (std::size_t k = 0; k < j.size(); ++k)
+                for (std::size_t e = 0; e < j[k].size(); ++e) {
+                    const double fd = (static_cast<double>(yp[k][e]) - static_cast<double>(ym[k][e])) / (2.0 * h);
+                    const double jv = static_cast<double>(j[k][e]);
+                    err2 += (jv - fd) * (jv - fd);
+                    fd2 += fd * fd;
+                    jv2 += jv * jv;
+                }
+            const double err = std::sqrt(err2);
+            const double den = std::max(std::sqrt(fd2), std::sqrt(jv2));
+            if (!(err <= o.rtol * den + o.atol)) fd_ok = false;
+            rep.fd_max_rel_err = std::max(rep.fd_max_rel_err, err / std::max(den, 1e-30));
+        }
+        rep.fd_pass = fd_ok;
+
+        // The dot-product test: <JVP(vd), wd> = <vd, VJP(wd)>.
+        if (rep.has_vjp) {
+            detail::check_launchable(*c, false);
+            const Vec jv = jvp(vd);
+            double    s1 = 0;
+            for (std::size_t k = 0; k < jv.size(); ++k)
+                for (std::size_t e = 0; e < jv[k].size(); ++e) s1 += static_cast<double>(jv[k][e]) * static_cast<double>(wd[k][e]);
+            std::unordered_map<const detail::VarMeta*, std::vector<float>> seeds;
+            for (std::size_t k = 0; k < vs.out.size(); ++k) seeds[vs.out[k]] = wd[k];
+            d.sweep(s.rt, launched, false, seeds);
+            double s2 = 0;
+            for (std::size_t k = 0; k < vs.in.size(); ++k) {
+                const std::vector<float> g = d.read(vs.in[k]);
+                for (std::size_t e = 0; e < g.size(); ++e) s2 += static_cast<double>(vd[k][e]) * static_cast<double>(g[e]);
+            }
+            const double diff = std::fabs(s1 - s2);
+            const double mag  = std::fabs(s1) + std::fabs(s2);
+            rep.dot_rel_err   = diff / std::max(mag, 1e-30);
+            rep.dot_pass      = diff <= 1e-3 * mag + 1e-6;
+        }
+
+        set_inputs(x0);
+        return rep;
+    }
+
 private:
     struct Impl {
         Impl(detail::ResolvedConfig cfg_in, RootFactory mk)
@@ -597,6 +862,7 @@ private:
         /// A fresh ModelMeta with a fresh root, and the children added before setup() added again (a reset starts here).
         /// The old meta goes first: its data is freed while the pools are alive.
         void build() {
+            deriv.reset();  // the derivative buffers reference the old variables
             meta.reset();
             auto fresh = std::make_shared<detail::ModelMeta>();
             auto r     = make_root();
@@ -680,6 +946,7 @@ private:
         RootFactory         make_root;
         std::vector<std::function<void(System&)>> adds;  ///< model.add_subsystem calls, in order, for a reset
         bool                setup_done = false;
+        std::unique_ptr<detail::DerivSession> deriv;  ///< the derivative buffers; destroyed right after meta, before rt
         std::shared_ptr<detail::ModelMeta> meta;  ///< LAST: destroyed first
     };
 
@@ -694,6 +961,11 @@ private:
         if (!s.setup_done || s.meta->state == detail::Lifecycle::created)
             throw std::logic_error(std::string{"naga::cospan: Model::"} + verb + " before setup() has completed");
         return s;
+    }
+    /// Derivatives need a finished run: finalized, and at least one forward.
+    static void require_ran(const Impl& s, const char* verb) {
+        if (s.meta->state != detail::Lifecycle::finalized || s.rt.forward == 0)
+            throw std::logic_error(std::string{"naga::cospan: "} + verb + " needs a prior run()");
     }
     SubsystemHandle root_handle(const char* verb) const {
         Impl& s = ready(verb);

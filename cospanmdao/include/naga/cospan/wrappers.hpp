@@ -94,6 +94,16 @@ struct Input {
         return data_[detail::offset_of_flat<Rank>(flat, shape_, stride_)];
     }
 
+    /// Adjoint views only: atomically accumulates into the element (casts away const). Derivative kernels accumulate, never assign.
+    void add(sycl::id<Rank> idx, value_type v) const {
+        value_type* p = const_cast<value_type*>(data_ + detail::offset_of<Rank>(idx, stride_));
+        sycl::atomic_ref<value_type, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space>{*p}.fetch_add(v);
+    }
+    void add(std::size_t flat, value_type v) const {
+        value_type* p = const_cast<value_type*>(data_ + detail::offset_of_flat<Rank>(flat, shape_, stride_));
+        sycl::atomic_ref<value_type, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space>{*p}.fetch_add(v);
+    }
+
     sycl::range<Rank> shape() const { return shape_; }
     sycl::range<Rank> stride() const { return stride_; }
     std::size_t       size() const { return detail::range_size<Rank>(shape_); }
@@ -139,6 +149,29 @@ struct Output {
         requires(is_atomic_v<DT>)
     {
         return atomic_type{data_[detail::offset_of_flat<Rank>(flat, shape_, stride_)]};
+    }
+
+    /// The value of the element (an atomic dtype loads atomically).
+    value_type get(sycl::id<Rank> idx) const {
+        if constexpr (is_atomic_v<DT>) return atomic_type{data_[detail::offset_of<Rank>(idx, stride_)]}.load();
+        else return data_[detail::offset_of<Rank>(idx, stride_)];
+    }
+    value_type get(std::size_t flat) const {
+        if constexpr (is_atomic_v<DT>) return atomic_type{data_[detail::offset_of_flat<Rank>(flat, shape_, stride_)]}.load();
+        else return data_[detail::offset_of_flat<Rank>(flat, shape_, stride_)];
+    }
+    /// Atomically accumulates into the element (derivative kernels accumulate, never assign).
+    void add(sycl::id<Rank> idx, value_type v) const
+        requires(!is_atomic_v<DT>)
+    {
+        sycl::atomic_ref<value_type, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space>{
+            data_[detail::offset_of<Rank>(idx, stride_)]}.fetch_add(v);
+    }
+    void add(std::size_t flat, value_type v) const
+        requires(!is_atomic_v<DT>)
+    {
+        sycl::atomic_ref<value_type, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space>{
+            data_[detail::offset_of_flat<Rank>(flat, shape_, stride_)]}.fetch_add(v);
     }
 
     sycl::range<Rank> shape() const { return shape_; }

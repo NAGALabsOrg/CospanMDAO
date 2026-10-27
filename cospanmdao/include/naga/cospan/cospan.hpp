@@ -2,6 +2,7 @@
 
 // naga/cospan/cospan.hpp — umbrella
 
+#include "naga/cospan/derivative_error.hpp"
 #include "naga/cospan/diagnostics.hpp"
 #include "naga/cospan/dtype.hpp"
 #include "naga/cospan/host_view.hpp"
@@ -20,4 +21,5 @@
 #include "naga/cospan/system.hpp"
 #include "naga/cospan/fused_component.hpp"
 #include "naga/cospan/model_config.hpp"
+#include "naga/cospan/derivative.hpp"
 #include "naga/cospan/model.hpp"

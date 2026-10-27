@@ -46,6 +46,9 @@ public:
         for (ComponentBase* c : parts_) c->add_dependencies(deps);
     }
 
+    /// The components this driver owns, in order (derivatives walk them).
+    const std::vector<ComponentBase*>& parts() const { return parts_; }
+
 protected:
     ComponentDriver() = default;
 

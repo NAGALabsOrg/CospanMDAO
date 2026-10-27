@@ -34,6 +34,7 @@
 
 #include <sycl/sycl.hpp>
 
+#include "naga/cospan/derivative_error.hpp"
 #include "naga/cospan/dispatch.hpp"
 #include "naga/cospan/dtype.hpp"
 #include "naga/cospan/metadata.hpp"
@@ -152,6 +153,12 @@ public:
     /// Writes the component's member wrapper from the current shape and data. Aliases have none.
     virtual void point_wrapper() {}
 
+    /// Derivatives: writes the member-type wrapper at `wrapper` over the buffer `data` (a float array), with this variable's
+    /// shape. `wrapper` points at an Input<f32,R> / Output<f32,R> of this port's type.
+    virtual void point_wrapper_into(void* /*wrapper*/, void* /*data*/) const {
+        throw std::logic_error("naga::cospan: '" + full_path() + "' has no member wrapper");
+    }
+
     /// A dense Input port (not RaggedInput): it cannot see per-index extents (wiring.hpp, connect).
     virtual bool is_dense_input_port() const { return false; }
 };
@@ -199,6 +206,29 @@ protected:
         WrapperAccess::write_wrapper(w, g, base);
     }
 
+    /// The derivative form of point(): the same geometry over a float buffer; f32 only, dense only.
+    template <class W>
+    void point_deriv(W& w, void* buf) const {
+        if constexpr (DT == DType::f32) {
+            const ResolvedShape& s = meta->shape;
+            if (s.ragged())
+                throw DerivativeError("naga::cospan: ragged variable on a derivative path: '" + full_path() + "'");
+            Geometry g;
+            if (s.known) {
+                g.shape  = s.extents;
+                g.stride = contiguous_strides(s.extents);
+            } else {
+                g.shape  = {0, 0, 0};
+                g.stride = {0, 0, 0};
+            }
+            WrapperAccess::write_wrapper(w, g, static_cast<float*>(buf));
+        } else {
+            (void)w;
+            (void)buf;
+            throw DerivativeError("naga::cospan: derivatives need f32: '" + full_path() + "'");
+        }
+    }
+
     /// A ragged wrapper: the data, the block count, and this instance's device copies of the index arrays. A DENSE
     /// variable is accepted too (offsets null: block i is row i of the rectangle).
     template <class W>
@@ -233,6 +263,9 @@ public:
     void point_wrapper() override {
         if (member_ != nullptr) this->point(*member_);
     }
+    void point_wrapper_into(void* wrapper, void* buf) const override {
+        this->point_deriv(*static_cast<Input<DT, Rank>*>(wrapper), buf);
+    }
     Input<DT, Rank>& member() const { return *member_; }
     bool is_dense_input_port() const override { return true; }
 
@@ -253,6 +286,9 @@ public:
     void point_wrapper() override {
         if (member_ != nullptr) this->point(*member_);
     }
+    void point_wrapper_into(void* wrapper, void* buf) const override {
+        this->point_deriv(*static_cast<Output<DT, Rank>*>(wrapper), buf);
+    }
     Output<DT, Rank>& member() const { return *member_; }
 
 private:
@@ -272,6 +308,9 @@ public:
     void point_wrapper() override {
         if (member_ != nullptr) this->point_ragged(*member_);
     }
+    void point_wrapper_into(void*, void*) const override {
+        throw DerivativeError("naga::cospan: ragged variable on a derivative path: '" + this->full_path() + "'");
+    }
 
 private:
     RaggedInput<DT, Rank>* member_;
@@ -288,6 +327,9 @@ public:
 
     void point_wrapper() override {
         if (member_ != nullptr) this->point_ragged(*member_);
+    }
+    void point_wrapper_into(void*, void*) const override {
+        throw DerivativeError("naga::cospan: ragged variable on a derivative path: '" + this->full_path() + "'");
     }
 
 private:

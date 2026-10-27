@@ -108,6 +108,15 @@ struct AsIsTag {};
 inline constexpr AsIsTag as_is{};
 
 namespace detail {
+/// Derivatives: which buffer a derivative kernel's wrapper is pointed at (the DerivSession decides, derivative.hpp).
+enum class DerivRole { tangent_in, tangent_out, adjoint_in, adjoint_out };
+struct DerivBinding {
+    virtual ~DerivBinding() = default;
+    virtual void* pointer(const detail::Instance& inst, DerivRole role) const = 0;
+};
+}  // namespace detail
+
+namespace detail {
 /// What set_shape takes per dimension: an integer, or cs::as_is.
 template <class E>
 concept DimEntry = std::integral<std::remove_cvref_t<E>> || std::same_as<std::remove_cvref_t<E>, AsIsTag>;
@@ -188,6 +197,16 @@ public:
     /// never initialized.
     /// Per-forward shape control: shape_of / set_shape are legal here only.
     virtual void prepare_forward() {}
+
+    // ---- derivatives (phase 1): a component with compute_jvp / compute_vjp launches them on buffers the session binds ----
+    virtual bool has_jvp() const { return false; }
+    virtual bool has_vjp() const { return false; }
+    virtual sycl::event launch_jvp(detail::Runtime&, const detail::DerivBinding&, const std::vector<sycl::event>&) {
+        throw DerivativeError("naga::cospan: " + describe() + " has no compute_jvp");
+    }
+    virtual sycl::event launch_vjp(detail::Runtime&, const detail::DerivBinding&, const std::vector<sycl::event>&) {
+        throw DerivativeError("naga::cospan: " + describe() + " has no compute_vjp");
+    }
 
     // ---- declaration API (legal inside declare() only) ------------------------
     // A declaration says, per dimension, only SPECIFIED (an integer) or UNSPECIFIED (cs::unspecified); it is the
@@ -541,6 +560,9 @@ protected:
     /// The component's device: its first instance's (set_device moves them all together), else the default.
     sycl::device device_of() const { return order_.empty() ? detail::default_device() : order_.front()->device; }
 
+    /// The ports by the address of their member wrapper (derivative launches rewrite copies of the members by offset).
+    const std::unordered_map<const void*, detail::Instance*>& members_by_pointer() const { return by_member_; }
+
     std::vector<sycl::event> last_events_;  ///< the last launch's events
     std::vector<sycl::event> pending_deps_; ///< depends_on events, for the next submission only
 
@@ -760,6 +782,7 @@ struct ComponentAccess {
     static std::vector<sycl::event>            gather_deps(ComponentBase& c, Runtime& rt) { return c.gather_deps(rt); }
     static void                                record_launch(ComponentBase& c, const std::vector<sycl::event>& ev) { c.record_launch(ev); }
     static sycl::device                        device_of(const ComponentBase& c) { return c.device_of(); }
+    static const std::vector<std::shared_ptr<Instance>>& ports(const ComponentBase& c) { return c.order_; }
 };
 
 // ---- GroupLauncher (declared in group_launch.hpp) ----------------------------------------------------------------------------
@@ -992,7 +1015,7 @@ public:
 
     KernelLaunch(sycl::range<R> range, std::optional<sycl::range<R>> wg,
                  typename KB::Inputs in, typename KB::Outputs out, KB body, Local local)
-        : args_{in, out, body, local} {
+        : args_{in, out, body, local}, range_r_{range}, wg_r_{wg}, local_{local} {
         args_.range       = pad3<R>(range);  // in the trailing dimensions
         args_.flat_extent = range.size();
         parts_.rank        = R;
@@ -1026,11 +1049,106 @@ public:
     const StageArgs<KB>& arguments() const { return args_; }
     sycl::range<3>       units() const { return args_.units; }
 
+    /// The launch parameters as given (a derivative launch reuses them).
+    sycl::range<R>                 range_r() const { return range_r_; }
+    std::optional<sycl::range<R>>  wg_r() const { return wg_r_; }
+    const Local&                   local_value() const { return local_; }
+
 private:
     static_assert(std::is_trivially_copyable_v<StageArgs<KB>>);
 
     StageArgs<KB> args_;
     KernelParts   parts_;
+    sycl::range<R>                range_r_;
+    std::optional<sycl::range<R>> wg_r_;
+    Local                         local_;
+};
+
+/// A one-stage launcher for a derivative kernel: the same device path as the forward (launch_group / launch_range with
+/// stage_fn<KB>), always solo, ordered only by the events it is given. Not part of the forward's launch bookkeeping.
+template <class KB>
+class DerivLauncher {
+public:
+    sycl::event launch(Runtime& rt, const sycl::device& dev, const KernelLaunch<KB>& kl, const std::vector<sycl::event>& deps,
+                       const std::string& who) {
+        static_assert(IndexRangeBody<KB> || GroupRangeBody<KB>,
+                      "cospan: compute_jvp/compute_vjp must take the same item (and LocalMem) as compute_forward");
+        static_assert(KernelBodyC<KB>, "cospan: compute_jvp/compute_vjp must take the same item (and LocalMem) as compute_forward");
+        if (!args_) {
+            dev_ = dev;
+            args_.emplace(rt.allocator_for<StageArgs<KB>>(dev, sk::kind::device));
+            args_->reserve(1);
+            ptrs_.emplace(rt.allocator_for<const void*>(dev, sk::kind::device));
+            const void* p = args_->data();
+            ptrs_->from_host(std::span<const void* const>{&p, 1});
+            sycl::event::wait(ptrs_->read_deps());
+            geo_.emplace(rt.allocator_for<StageGeometry>(dev, sk::kind::device));
+        } else if (!(*dev_ == dev)) {
+            throw std::logic_error(who + ": device changed");
+        }
+
+        const sycl::range<3> u = kl.units();
+        if (u[0] * u[1] * u[2] == 0) return rt.uq.single_task(dev, deps, []() {});
+
+        args_->from_host(std::span<const StageArgs<KB>>{&kl.arguments(), 1});
+
+        constexpr std::size_t T = (sizeof(SegmentInfo) + sizeof(StageGeometry) - 1) / sizeof(StageGeometry);
+        std::vector<StageGeometry> hg(1 + T);
+        const std::uint64_t groups = static_cast<std::uint64_t>(u[0]) * u[1] * u[2];
+        hg[0].ticket_state = nullptr;
+        hg[0].total_groups = groups;
+        hg[0].segment      = 0;
+        hg[0].segments     = 1;
+        hg[0].stages       = 1;
+        hg[0].local_offset = 0;
+        hg[0].local_bytes  = static_cast<std::uint32_t>(kl.kernel()->local_bytes);
+        hg[0].range_mode   = static_cast<std::uint32_t>(RangeMode::own);
+        hg[0].split        = static_cast<std::uint32_t>(Split::pad);
+        SegmentInfo si{};
+        si.range[0] = u[0];
+        si.range[1] = u[1];
+        si.range[2] = u[2];
+        si.count    = groups;
+        si.first    = 0;
+        si.offset   = 0;
+        si.boundary = static_cast<std::uint64_t>(Boundary::none);
+        std::memcpy(static_cast<void*>(&hg[1]), &si, sizeof(SegmentInfo));
+        if (geo_->capacity() < hg.size()) geo_->reserve(hg.size());
+        geo_->from_host(std::span<const StageGeometry>{hg});
+
+        const std::size_t local_bytes = kl.kernel()->local_bytes;
+        const std::size_t local_limit = dev.get_info<sycl::info::device::local_mem_size>();
+        if (local_bytes > local_limit)
+            throw std::invalid_argument(who + ": needs " + std::to_string(local_bytes) + " bytes of local memory but the device offers " +
+                                        std::to_string(local_limit));
+
+        std::vector<sycl::event> all = deps;
+        const auto               add = [&](const std::vector<sycl::event>& v) { all.insert(all.end(), v.begin(), v.end()); };
+        add(args_->read_deps());
+        add(geo_->read_deps());
+        add(ptrs_->read_deps());
+
+        sycl::event ev;
+        if constexpr (GroupRangeBody<KB>) {
+            auto& cfg = group_config(std::vector<JitId>{stage_definition_id<KB>()}, run_stages_id());
+            const sycl::range<3> wg = *kl.kernel()->wg;
+            ev = launch_group(rt.uq, dev, all, cfg, sycl::nd_range<3>{sycl::range<3>{u[0] * wg[0], u[1] * wg[1], u[2] * wg[2]}, wg},
+                              geo_->data(), ptrs_->data(), local_bytes);
+        } else {
+            auto& cfg = group_config(std::vector<JitId>{stage_definition_id<KB>()}, run_index_stages_id());
+            ev = launch_range(rt.uq, dev, all, cfg, u, geo_->data(), ptrs_->data());
+        }
+        args_->register_read(ev);
+        geo_->register_read(ev);
+        ptrs_->register_read(ev);
+        return ev;
+    }
+
+private:
+    std::optional<sycl::device>                  dev_;
+    std::optional<sk::usm_vector<StageArgs<KB>>> args_;
+    std::optional<sk::usm_vector<const void*>>   ptrs_;
+    std::optional<sk::usm_vector<StageGeometry>> geo_;
 };
 
 /// A custom-operation launch (D1): the body runs at submission as an
@@ -1337,6 +1455,71 @@ struct SynthBody : SynthImpl<X, body_kind_v<X>, (impl_traits<X>::nargs == 4)> {
     SynthBody(const typename X::Inputs& i, const typename X::Outputs& o) : Base{i, o} {}
 };
 
+// ---- derivative bodies (phase 1) --------------------------------------------------------------------------------------------
+/// What a compute_jvp / compute_vjp kernel receives, as the body's Inputs; the body's Outputs is empty.
+template <class X> struct JvpArgs { typename X::Inputs x; typename X::Inputs dx; typename X::Outputs dy; };
+template <class X> struct VjpArgs { typename X::Inputs x; typename X::Outputs ybar; typename X::Inputs xbar; };
+struct NoOutputs {};
+template <class X> concept HasJvp = requires { &X::compute_jvp; };
+template <class X> concept HasVjp = requires { &X::compute_vjp; };
+
+template <class X, int Kind, bool LM> struct SynthJvpImpl {};
+template <class X, int Kind, bool LM> struct SynthVjpImpl {};
+
+template <class X>
+struct SynthJvpImpl<X, 0, false> {
+    using Inputs  = JvpArgs<X>;
+    using Outputs = NoOutputs;
+    void operator()(sycl::id<first_traits<typename impl_traits<X>::a0>::rank> i, Inputs in, Outputs) const {
+        X::compute_jvp(i, in.x, in.dx, in.dy);
+    }
+};
+template <class X>
+struct SynthJvpImpl<X, 1, false> {
+    using Inputs  = JvpArgs<X>;
+    using Outputs = NoOutputs;
+    void operator()(GroupItem<first_traits<typename impl_traits<X>::a0>::rank> it, Inputs in, Outputs) const {
+        X::compute_jvp(it, in.x, in.dx, in.dy);
+    }
+};
+template <class X>
+struct SynthJvpImpl<X, 1, true> {
+    using Inputs  = JvpArgs<X>;
+    using Outputs = NoOutputs;
+    void operator()(GroupItem<first_traits<typename impl_traits<X>::a0>::rank> it, Inputs in, Outputs,
+                    std::remove_cvref_t<typename impl_traits<X>::a3> lm) const {
+        X::compute_jvp(it, in.x, in.dx, in.dy, lm);
+    }
+};
+template <class X>
+struct SynthVjpImpl<X, 0, false> {
+    using Inputs  = VjpArgs<X>;
+    using Outputs = NoOutputs;
+    void operator()(sycl::id<first_traits<typename impl_traits<X>::a0>::rank> i, Inputs in, Outputs) const {
+        X::compute_vjp(i, in.x, in.ybar, in.xbar);
+    }
+};
+template <class X>
+struct SynthVjpImpl<X, 1, false> {
+    using Inputs  = VjpArgs<X>;
+    using Outputs = NoOutputs;
+    void operator()(GroupItem<first_traits<typename impl_traits<X>::a0>::rank> it, Inputs in, Outputs) const {
+        X::compute_vjp(it, in.x, in.ybar, in.xbar);
+    }
+};
+template <class X>
+struct SynthVjpImpl<X, 1, true> {
+    using Inputs  = VjpArgs<X>;
+    using Outputs = NoOutputs;
+    void operator()(GroupItem<first_traits<typename impl_traits<X>::a0>::rank> it, Inputs in, Outputs,
+                    std::remove_cvref_t<typename impl_traits<X>::a3> lm) const {
+        X::compute_vjp(it, in.x, in.ybar, in.xbar, lm);
+    }
+};
+
+template <class X> struct SynthJvpBody : SynthJvpImpl<X, body_kind_v<X>, (impl_traits<X>::nargs == 4)> {};
+template <class X> struct SynthVjpBody : SynthVjpImpl<X, body_kind_v<X>, (impl_traits<X>::nargs == 4)> {};
+
 }  // namespace detail
 
 // -----------------------------------------------------------------------------
@@ -1454,6 +1637,69 @@ public:
     /// USER, every forward: state the launch with create_launch_config(descriptors...). Returns the description the component
     /// submits.
     virtual std::unique_ptr<LaunchDescription> define_forward() = 0;
+
+    // ---- derivatives (phase 1) ----
+    bool has_jvp() const override { return detail::HasJvp<X>; }
+    bool has_vjp() const override { return detail::HasVjp<X>; }
+
+    sycl::event launch_jvp(detail::Runtime& rt, const detail::DerivBinding& b, const std::vector<sycl::event>& deps) override {
+        if constexpr (!detail::HasJvp<X>) {
+            return ComponentBase::launch_jvp(rt, b, deps);
+        } else {
+            using KB = detail::SynthJvpBody<X>;
+            static_assert(IndexRangeBody<KB> || GroupRangeBody<KB>,
+                          "cospan: compute_jvp/compute_vjp must take the same item (and LocalMem) as compute_forward");
+            static_assert(KernelBodyC<KB>, "cospan: compute_jvp/compute_vjp must take the same item (and LocalMem) as compute_forward");
+            X&                                 self = static_cast<X&>(*this);
+            std::unique_ptr<LaunchDescription> fd   = define_forward();
+            auto&                              kl   = dynamic_cast<detail::KernelLaunch<detail::SynthBody<X>>&>(*fd);
+            typename X::Inputs                 x = self.inputs, dx = self.inputs;
+            typename X::Outputs                dy = self.outputs;
+            rebind_ports_(dx, &self.inputs, IOKind::input, detail::DerivRole::tangent_in, b);
+            rebind_ports_(dy, &self.outputs, IOKind::output, detail::DerivRole::tangent_out, b);
+            detail::KernelLaunch<KB> kd{kl.range_r(), kl.wg_r(), detail::JvpArgs<X>{x, dx, dy}, detail::NoOutputs{}, KB{}, kl.local_value()};
+            if (!jvp_launcher_) jvp_launcher_ = std::make_shared<detail::DerivLauncher<KB>>();
+            return static_cast<detail::DerivLauncher<KB>*>(jvp_launcher_.get())->launch(rt, this->device_of(), kd, deps, this->describe() + " (jvp)");
+        }
+    }
+
+    sycl::event launch_vjp(detail::Runtime& rt, const detail::DerivBinding& b, const std::vector<sycl::event>& deps) override {
+        if constexpr (!detail::HasVjp<X>) {
+            return ComponentBase::launch_vjp(rt, b, deps);
+        } else {
+            using KB = detail::SynthVjpBody<X>;
+            static_assert(IndexRangeBody<KB> || GroupRangeBody<KB>,
+                          "cospan: compute_jvp/compute_vjp must take the same item (and LocalMem) as compute_forward");
+            static_assert(KernelBodyC<KB>, "cospan: compute_jvp/compute_vjp must take the same item (and LocalMem) as compute_forward");
+            X&                                 self = static_cast<X&>(*this);
+            std::unique_ptr<LaunchDescription> fd   = define_forward();
+            auto&                              kl   = dynamic_cast<detail::KernelLaunch<detail::SynthBody<X>>&>(*fd);
+            typename X::Inputs                 x = self.inputs, xbar = self.inputs;
+            typename X::Outputs                ybar = self.outputs;
+            rebind_ports_(ybar, &self.outputs, IOKind::output, detail::DerivRole::adjoint_in, b);
+            rebind_ports_(xbar, &self.inputs, IOKind::input, detail::DerivRole::adjoint_out, b);
+            detail::KernelLaunch<KB> kd{kl.range_r(), kl.wg_r(), detail::VjpArgs<X>{x, ybar, xbar}, detail::NoOutputs{}, KB{}, kl.local_value()};
+            if (!vjp_launcher_) vjp_launcher_ = std::make_shared<detail::DerivLauncher<KB>>();
+            return static_cast<detail::DerivLauncher<KB>*>(vjp_launcher_.get())->launch(rt, this->device_of(), kd, deps, this->describe() + " (vjp)");
+        }
+    }
+
+private:
+    /// Rewrites, in a copy `view` of `inputs` or `outputs`, the wrapper of every port of `kind` to the buffer the session
+    /// binds for `role` (the member's offset in the struct locates it).
+    template <class V>
+    void rebind_ports_(V& view, const void* struct_base, IOKind kind, detail::DerivRole role, const detail::DerivBinding& b) {
+        for (const auto& [member, inst] : this->members_by_pointer()) {
+            if (inst->kind != kind) continue;
+            const std::ptrdiff_t off = static_cast<const char*>(member) - static_cast<const char*>(struct_base);
+            if (off < 0 || off >= static_cast<std::ptrdiff_t>(sizeof(V)))
+                throw std::logic_error(this->describe() + ": a port is not inside inputs/outputs");
+            inst->point_wrapper_into(reinterpret_cast<char*>(&view) + off, b.pointer(*inst, role));
+        }
+    }
+    // Type-erased: Component<X> is instantiated while X is incomplete, so the launcher types (which read X) cannot be members.
+    std::shared_ptr<void> jvp_launcher_;
+    std::shared_ptr<void> vjp_launcher_;
 
 protected:
     std::unique_ptr<LaunchDescription> describe_launch() override { return define_forward(); }
