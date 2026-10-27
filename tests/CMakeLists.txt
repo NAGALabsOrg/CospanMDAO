@@ -38,6 +38,7 @@ set(COSPAN_TEST_SOURCES
     test_range_split.cpp
     test_rework.cpp
     test_shapes.cpp
+    test_solvers.cpp
     test_diagnostics.cpp
     test_epochs.cpp
     test_system.cpp
