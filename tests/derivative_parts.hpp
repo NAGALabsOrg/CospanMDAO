@@ -125,6 +125,56 @@ public:
     std::unique_ptr<cs::LaunchDescription> define_forward() override { return create_launch_config(cs::range_desc(sycl::range<1>{1})); }
 };
 
+/// The Sellar constraint c = 3.16 - y1 (<= 0).
+class Con1 : public cs::Component<Con1> {
+public:
+    struct Inputs {
+        cs::Input<DType::f32, 1> y1;
+    };
+    struct Outputs {
+        cs::Output<DType::f32, 1> c;
+    };
+    static void compute_forward(sycl::id<1>, const Inputs& in, const Outputs& out) { out.c[std::size_t{0}] = 3.16f - in.y1[std::size_t{0}]; }
+    static void compute_jvp(sycl::id<1>, const Inputs&, const Inputs& dx, const Outputs& dc) { dc.c.add(std::size_t{0}, -dx.y1[std::size_t{0}]); }
+    static void compute_vjp(sycl::id<1>, const Inputs&, const Outputs& ybar, const Inputs& xbar) {
+        xbar.y1.add(std::size_t{0}, -ybar.c.get(std::size_t{0}));
+    }
+
+    Inputs  inputs;
+    Outputs outputs;
+
+    void declare() override {
+        declare_input(inputs.y1, "y1", 1);
+        declare_output(outputs.c, "c", 1);
+    }
+    std::unique_ptr<cs::LaunchDescription> define_forward() override { return create_launch_config(cs::range_desc(sycl::range<1>{1})); }
+};
+
+/// The Sellar constraint c = y2 - 24 (<= 0).
+class Con2 : public cs::Component<Con2> {
+public:
+    struct Inputs {
+        cs::Input<DType::f32, 1> y2;
+    };
+    struct Outputs {
+        cs::Output<DType::f32, 1> c;
+    };
+    static void compute_forward(sycl::id<1>, const Inputs& in, const Outputs& out) { out.c[std::size_t{0}] = in.y2[std::size_t{0}] - 24.0f; }
+    static void compute_jvp(sycl::id<1>, const Inputs&, const Inputs& dx, const Outputs& dc) { dc.c.add(std::size_t{0}, dx.y2[std::size_t{0}]); }
+    static void compute_vjp(sycl::id<1>, const Inputs&, const Outputs& ybar, const Inputs& xbar) {
+        xbar.y2.add(std::size_t{0}, ybar.c.get(std::size_t{0}));
+    }
+
+    Inputs  inputs;
+    Outputs outputs;
+
+    void declare() override {
+        declare_input(inputs.y2, "y2", 1);
+        declare_output(outputs.c, "c", 1);
+    }
+    std::unique_ptr<cs::LaunchDescription> define_forward() override { return create_launch_config(cs::range_desc(sycl::range<1>{1})); }
+};
+
 
 /// The Sellar objective at (z0, z1, x) with y2 held at 1.5 in d1: y1 = z0^2 + z1 + x - 0.3, then d2 and the objective.
 inline double sellar_f(double z0, double z1, double x) {

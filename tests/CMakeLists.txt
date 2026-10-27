@@ -30,6 +30,7 @@ set(COSPAN_TEST_SOURCES
     test_host_access.cpp
     test_init_shapes.cpp
     test_model.cpp
+    test_optimizers.cpp
     test_p4.cpp
     test_r04.cpp
     test_r05.cpp
