@@ -4,6 +4,8 @@
 
 #include "naga/cospan/derivative_error.hpp"
 #include "naga/cospan/solver.hpp"
+#include "naga/cospan/optimizer.hpp"
+#include "naga/cospan/ipopt.hpp"
 #include "naga/cospan/diagnostics.hpp"
 #include "naga/cospan/dtype.hpp"
 #include "naga/cospan/host_view.hpp"

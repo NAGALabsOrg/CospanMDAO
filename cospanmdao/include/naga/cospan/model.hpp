@@ -34,9 +34,11 @@
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <initializer_list>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
@@ -58,6 +60,7 @@
 #include "naga/cospan/instance.hpp"
 #include "naga/cospan/metadata.hpp"
 #include "naga/cospan/model_config.hpp"
+#include "naga/cospan/optimizer.hpp"
 #include "naga/cospan/model_meta.hpp"
 #include "naga/cospan/run_policy.hpp"
 #include "naga/cospan/runtime.hpp"
@@ -568,6 +571,22 @@ public:
     }
     /// The GMRES options of the coupled linear solves in compute_totals through cycles.
     void set_linear_options(GmresOptions o) { impl("set_linear_options").lin_opts = o; }
+
+    // ---- optimization (docs/optimizers.md) ---------------------------------------------------
+    /// Optimizes the design variables for the one objective and the constraints (the marks), in the reduced space: the model, with
+    /// its solvers, is converged inside every evaluation. Runs the model first if it has not run. The result (x, f, g, constr_viol)
+    /// is in the model's UNscaled units, and the model is left at the result's x (run, waited).
+    OptimizeResult optimize(Optimizer& o) {
+        Impl& s = ready("optimize");
+        if (s.meta->objectives.size() != 1) throw OptimizerError("naga::cospan: optimize needs exactly one objective");
+        if (s.meta->design_vars.empty()) throw OptimizerError("naga::cospan: optimize needs at least one design variable");
+        if (s.meta->state != detail::Lifecycle::finalized || s.rt.forward == 0) run();
+        wait();
+        ModelNlp       nlp{*this, s};
+        OptimizeResult r = nlp.unscale(o.optimize(nlp));
+        nlp.write_unscaled(r.x);
+        return r;
+    }
 
     /// Puts the subsystem at `path` (and everything under it) back in scope, counters reset, between runs: for every leaf in
     /// its range the leaf is rearmed and its policy's rearm called. On a subsystem already in scope it resets the counters.
@@ -1539,6 +1558,223 @@ private:
         std::unordered_set<const detail::VarMeta*>  Z_, active_op_;
         std::unordered_set<const detail::Instance*> reads_prev_;
         std::vector<ComponentBase*>         sel_f_, sel_r_;
+    };
+
+    /// The model as an NlpProblem in the optimizer's (scaled) units: x = the design variables flattened in mark order, g = the
+    /// constraints flattened in mark order. Scaling is OpenMDAO's affine form per element, x_s = (x - ref0) / (ref - ref0).
+    class ModelNlp final : public NlpProblem {
+    public:
+        ModelNlp(Model& model, Impl& s) : model_{model}, s_{s} {
+            for (const Mark& mk : s_.meta->design_vars) dvs_.push_back(item_of(mk, /*constraint=*/false));
+            for (const Mark& mk : s_.meta->constraints) cons_.push_back(item_of(mk, /*constraint=*/true));
+            obj_ = item_of(s_.meta->objectives.front(), false);
+            for (const Item& it : dvs_) nx_ += it.n;
+            for (const Item& it : cons_) ng_ += it.n;
+            cx_.assign(nx_, 0.0);
+        }
+
+        std::size_t n_vars() const override { return nx_; }
+        std::size_t n_cons() const override { return ng_; }
+
+        void bounds(std::span<double> xl, std::span<double> xu, std::span<double> gl, std::span<double> gu) const override {
+            std::size_t o = 0;
+            for (const Item& it : dvs_) {
+                for (std::size_t i = 0; i < it.n; ++i) scaled_bounds(it, i, xl[o + i], xu[o + i]);
+                o += it.n;
+            }
+            o = 0;
+            for (const Item& it : cons_) {
+                for (std::size_t i = 0; i < it.n; ++i) scaled_bounds(it, i, gl[o + i], gu[o + i]);
+                o += it.n;
+            }
+        }
+
+        void initial_point(std::span<double> x) const override {
+            std::size_t o = 0;
+            for (const Item& it : dvs_) {
+                const std::vector<float> v = detail::read_host(*it.inst);
+                for (std::size_t i = 0; i < it.n; ++i) x[o + i] = (static_cast<double>(v[i]) - it.ref0[i]) / (it.ref[i] - it.ref0[i]);
+                o += it.n;
+            }
+        }
+
+        bool eval_f(std::span<const double> x, double& f) override {
+            if (!evaluate(x)) return false;
+            f = f_;
+            return true;
+        }
+        bool eval_g(std::span<const double> x, std::span<double> g) override {
+            if (!evaluate(x)) return false;
+            std::copy(g_.begin(), g_.end(), g.begin());
+            return true;
+        }
+        bool eval_grad_f(std::span<const double> x, std::span<double> gf) override {
+            if (!evaluate(x) || !totals()) return false;
+            std::size_t o = 0;
+            for (std::size_t k = 0; k < dvs_.size(); ++k) {
+                const Item&         w = dvs_[k];
+                const JacBlock&     b = jac_->block(obj_.path, w.path);
+                const double        sy = obj_.ref[0] - obj_.ref0[0];
+                for (std::size_t c = 0; c < w.n; ++c) gf[o + c] = b.data[c] * (w.ref[c] - w.ref0[c]) / sy;
+                o += w.n;
+            }
+            return true;
+        }
+        bool eval_jac_g(std::span<const double> x, std::span<double> J) override {
+            if (!evaluate(x) || !totals()) return false;
+            std::size_t go = 0;
+            for (const Item& con : cons_) {
+                std::size_t xo = 0;
+                for (const Item& w : dvs_) {
+                    const JacBlock& b = jac_->block(con.path, w.path);
+                    for (std::size_t r = 0; r < con.n; ++r)
+                        for (std::size_t c = 0; c < w.n; ++c)
+                            J[(go + r) * nx_ + xo + c] = b.data[r * w.n + c] * (w.ref[c] - w.ref0[c]) / (con.ref[r] - con.ref0[r]);
+                    xo += w.n;
+                }
+                go += con.n;
+            }
+            return true;
+        }
+
+        /// Writes UNscaled design values into the model and runs it.
+        void write_unscaled(const std::vector<double>& xu) {
+            std::size_t o = 0;
+            for (const Item& it : dvs_) {
+                std::vector<float> v(it.n);
+                for (std::size_t i = 0; i < it.n; ++i) v[i] = static_cast<float>(xu[o + i]);
+                const detail::VarMeta&   meta = *it.inst->meta;
+                std::vector<std::size_t> ext(meta.shape.extents.begin(), meta.shape.extents.begin() + meta.rank);
+                model_.update_input(it.path, init::from_host(std::move(v), init::Shape{ext}));
+                o += it.n;
+            }
+            model_.run();
+            model_.wait();
+        }
+
+        /// The optimizer's scaled result in model units; constr_viol is recomputed against the unscaled bounds.
+        OptimizeResult unscale(OptimizeResult r) const {
+            std::size_t o = 0;
+            for (const Item& it : dvs_) {
+                for (std::size_t i = 0; i < it.n; ++i) r.x[o + i] = r.x[o + i] * (it.ref[i] - it.ref0[i]) + it.ref0[i];
+                o += it.n;
+            }
+            r.f = r.f * (obj_.ref[0] - obj_.ref0[0]) + obj_.ref0[0];
+            double viol = 0;
+            o           = 0;
+            for (const Item& it : cons_) {
+                for (std::size_t i = 0; i < it.n; ++i) {
+                    double& gv = r.g[o + i];
+                    gv         = gv * (it.ref[i] - it.ref0[i]) + it.ref0[i];
+                    if (std::isfinite(it.lo[i])) viol = std::max(viol, it.lo[i] - gv);
+                    if (std::isfinite(it.hi[i])) viol = std::max(viol, gv - it.hi[i]);
+                }
+                o += it.n;
+            }
+            r.constr_viol = viol;
+            return r;
+        }
+
+    private:
+        struct Item {
+            std::string                       path;
+            std::shared_ptr<detail::Instance> inst;
+            std::size_t                       n = 0;
+            std::vector<double>               ref, ref0;  // per element
+            std::vector<double>               lo, hi;     // per element, unscaled, +-inf when absent (an equality has lo == hi)
+        };
+
+        static std::vector<double> expand(const std::vector<double>& v, std::size_t n, const char* what, const std::string& path) {
+            if (v.size() == n) return v;
+            if (v.size() == 1) return std::vector<double>(n, v[0]);
+            throw OptimizerError(std::string{"naga::cospan: optimize: "} + what + " of '" + path + "' has " + std::to_string(v.size()) +
+                                 " values for " + std::to_string(n) + " elements");
+        }
+
+        Item item_of(const Mark& mk, bool constraint) const {
+            Item it;
+            it.path = mk.path;
+            it.inst = mk.inst.lock();
+            if (!it.inst) throw OptimizerError("naga::cospan: optimize: the instance of '" + mk.path + "' is gone");
+            if (it.inst->meta->dtype != DType::f32 || it.inst->meta->is_ragged())
+                throw OptimizerError("naga::cospan: optimize: '" + mk.path + "' is not a dense f32 variable");
+            it.n    = it.inst->meta->shape.elements();
+            it.ref  = expand(mk.rec.scaling.ref, it.n, "ref", mk.path);
+            it.ref0 = expand(mk.rec.scaling.ref0, it.n, "ref0", mk.path);
+            for (std::size_t i = 0; i < it.n; ++i)
+                if (it.ref[i] == it.ref0[i]) throw OptimizerError("naga::cospan: optimize: ref == ref0 for '" + mk.path + "'");
+            constexpr double inf = std::numeric_limits<double>::infinity();
+            it.lo.assign(it.n, -inf);
+            it.hi.assign(it.n, inf);
+            if (constraint && mk.rec.equals) {
+                it.lo = expand(*mk.rec.equals, it.n, "equals", mk.path);
+                it.hi = it.lo;
+            } else {
+                if (mk.rec.bounds.lower) it.lo = expand(*mk.rec.bounds.lower, it.n, "lower bound", mk.path);
+                if (mk.rec.bounds.upper) it.hi = expand(*mk.rec.bounds.upper, it.n, "upper bound", mk.path);
+            }
+            return it;
+        }
+
+        /// Bounds of element i in scaled units; lower and upper swap when ref < ref0.
+        static void scaled_bounds(const Item& it, std::size_t i, double& lo, double& hi) {
+            const double d = it.ref[i] - it.ref0[i];
+            const double a = (it.lo[i] - it.ref0[i]) / d, b = (it.hi[i] - it.ref0[i]) / d;
+            lo = d > 0 ? a : b;
+            hi = d > 0 ? b : a;
+        }
+
+        /// Writes x (scaled) into the model, runs it, reads f and g. Cached for the same x; false if the evaluation failed.
+        bool evaluate(std::span<const double> x) {
+            if (have_ && std::equal(x.begin(), x.end(), cx_.begin(), [](double a, double b) { return std::memcmp(&a, &b, sizeof(double)) == 0; }))
+                return ok_;
+            std::vector<double> xu(nx_);
+            std::size_t         o = 0;
+            for (const Item& it : dvs_) {
+                for (std::size_t i = 0; i < it.n; ++i) xu[o + i] = x[o + i] * (it.ref[i] - it.ref0[i]) + it.ref0[i];
+                o += it.n;
+            }
+            cx_.assign(x.begin(), x.end());
+            have_ = true;
+            jac_.reset();
+            ok_ = true;
+            write_unscaled(xu);
+            for (const auto& [name, node] : s_.meta->nodes)
+                if (node->last_solve && !node->last_solve->converged) ok_ = false;
+            const std::vector<float> fv = detail::read_host(*obj_.inst);
+            f_                           = (static_cast<double>(fv[0]) - obj_.ref0[0]) / (obj_.ref[0] - obj_.ref0[0]);
+            g_.clear();
+            for (const Item& it : cons_) {
+                const std::vector<float> gv = detail::read_host(*it.inst);
+                for (std::size_t i = 0; i < it.n; ++i) g_.push_back((static_cast<double>(gv[i]) - it.ref0[i]) / (it.ref[i] - it.ref0[i]));
+            }
+            if (!std::isfinite(f_)) ok_ = false;
+            for (const double v : g_)
+                if (!std::isfinite(v)) ok_ = false;
+            return ok_;
+        }
+
+        /// The totals at the last evaluated point, once per point. A DerivativeError is an evaluation failure.
+        bool totals() {
+            if (jac_) return true;
+            try {
+                jac_ = model_.compute_totals(DerivMode::automatic);
+            } catch (const DerivativeError&) {
+                return false;
+            }
+            return true;
+        }
+
+        Model&              model_;
+        Impl&               s_;
+        std::vector<Item>   dvs_, cons_;
+        Item                obj_;
+        std::size_t         nx_ = 0, ng_ = 0;
+        std::vector<double> cx_;
+        bool                have_ = false, ok_ = false;
+        double              f_ = 0;
+        std::vector<double> g_;
+        std::optional<Jacobian> jac_;
     };
 
     std::unique_ptr<Impl> s_;
