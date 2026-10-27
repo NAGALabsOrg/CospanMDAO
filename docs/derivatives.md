@@ -68,9 +68,12 @@ it compares the JVP with a central difference of the forward (step `h_rel * max(
 `rtol 2e-2`, `atol 1e-3`, 3 directions. The report has `fd_pass`, `dot_pass` and the errors. The model is left with its original
 inputs.
 
-## Limits of phase 1
+## Limits
 
-- No cycles: a cycle on the derivative path throws `DerivativeError` (a solver is needed).
+- Cycles are supported, with conditions: totals through a cycle assume the cycle is converged (attach a solver and `run()`
+  first), the cycle variable must have exactly one producer, and the coupled linear solve must converge (`DerivativeError`
+  otherwise). See [solvers](solvers.md).
+- `check_partials` is about one component and does no cycle handling.
 - No ragged ports. f32 only. One device per variable.
 - No run policies in scope (`DerivativeError`).
 - A derivative launch uses the forward's launch configuration (range, work-group shape, local memory).
