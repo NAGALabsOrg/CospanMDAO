@@ -22,6 +22,7 @@ find_package(Catch2 3 REQUIRED)
 set(COSPAN_TEST_SOURCES
     # test_chunked.cpp, test_leading_range.cpp, test_replay.cpp: chunked systems, kept for the redesign (not built)
     test_component.cpp
+    test_derivatives.cpp
     test_device_scan.cpp
     test_events.cpp
     test_flavors.cpp
